@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "UOCloneProject-ProcMapGen"
+version = "1.0.0"
+description = "Procedural Ultima Online map generator with a desktop GUI (Linux and Windows)"
+readme = "README.md"
+license = "GPL-3.0-only"
+license-files = ["LICENSE", "THIRD-PARTY-NOTICES.md"]
+authors = [{ name = "tomgsx" }]
+requires-python = ">=3.11"
+keywords = ["ultima-online", "map-generator", "procedural-generation", "mul"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Games/Entertainment",
+]
+dependencies = [
+  "numpy==2.4.6",
+  "scipy==1.18.0",
+  "Pillow==12.3.0",
+  "PySide6==6.11.1",
+  "edt==3.1.2"
+]
+
+[project.urls]
+Homepage = "https://github.com/tomgsx/UOCloneProject-ProcMapGen"
+Source = "https://github.com/tomgsx/UOCloneProject-ProcMapGen"
+Issues = "https://github.com/tomgsx/UOCloneProject-ProcMapGen/issues"
+
+[tool.setuptools.packages.find]
+include = ["gen*", "uo*", "gui*"]

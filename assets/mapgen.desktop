@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=UO MapGen
+Comment=Generate procedural Ultima Online maps
+Exec=./MapGen
+Icon=./mapgen.svg
+Terminal=false
+Categories=Game;Development;

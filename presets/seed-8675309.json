@@ -1,0 +1,42 @@
+{
+  "seed": 8675309,
+  "width": 7168,
+  "height": 4096,
+  "centre": [
+    0.4,
+    0.5
+  ],
+  "radii": [
+    0.3,
+    0.38
+  ],
+  "margin": 220,
+  "coast_wavelength": 900.0,
+  "coast_amp": 1.0,
+  "coast_detail": 0.22,
+  "coast_smooth": 2,
+  "islands": 4,
+  "min_island": 400,
+  "min_lake_size": 60,
+  "rivers": 6,
+  "lakes": 5,
+  "hill_levels": [
+    5,
+    10,
+    15,
+    20,
+    30,
+    40
+  ],
+  "ramp_slope": 2.0,
+  "hill_fraction": 0.45,
+  "mountain_fraction": 0.09,
+  "forest_fraction": 0.34,
+  "jungle_fraction": 0.08,
+  "desert_fraction": 0.07,
+  "snow_fraction": 0.05,
+  "swamp_fraction": 0.02,
+  "towns": 5,
+  "town_min_spacing": 550,
+  "road_width": 3
+}
