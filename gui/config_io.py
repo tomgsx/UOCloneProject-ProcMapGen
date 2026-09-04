@@ -46,14 +46,21 @@ class Setting:
     suffix: str = ""             # drawn after the number in its box
     advanced: bool = False       # fine-tuning: the form draws its label in italics
     parts: tuple[str, ...] = ()  # a fixed pair of numbers, one box each ("x", "y")
+    ordered: bool = False        # pair only: the first number may not exceed the second
     is_list: bool = False        # a free-length list of whole numbers, typed as text
     max_items: int = 0           # list only
+    choices: tuple[tuple[str, str], ...] = ()   # a drop-down: (stored value, label) pairs
+    beside: str = ""             # drawn on the row of this other setting, after its box
+    short: str = ""              # its label on that shared row
+    profile: str = ""            # shown only while temperature_profile has this value
 
     def format(self, number: float) -> str:
         text = f"{number:.{self.decimals}f}" if self.decimals else str(int(number))
         return text + self.suffix
 
     def range_text(self) -> str:
+        if self.choices:
+            return " or ".join(label for _value, label in self.choices)
         span = f"{self.format(self.minimum)} to {self.format(self.maximum)}"
         if self.parts:
             return f"{span} for each of {' and '.join(self.parts)}"
@@ -62,9 +69,28 @@ class Setting:
         return span
 
     def format_value(self, value: Any) -> str:
+        if self.choices:
+            return dict(self.choices).get(value, str(value))
         if self.parts or self.is_list:
             return ", ".join(self.format(v) for v in value)
         return self.format(value)
+
+
+def _band_setting(biome: str) -> Setting:
+    """The band of one biome: the same two boxes and the same words for all five."""
+    return Setting(
+        f"{biome}_band", f"{biome.capitalize()} band", BIOMES,
+        f"The part of the map, top to bottom, outside which {biome} never forms: 'top' "
+        f"is how far down the map it may start and 'bottom' how far down it may reach, "
+        f"as fractions of the map height (0.00 is the top edge, 1.00 the bottom edge). "
+        f"The band only fences {biome} in; the {biome} fraction decides how much of it "
+        f"forms. Inside the band the front stands in from each edge by a varying depth, "
+        f"touching the edge at its furthest points and withdrawing into bays elsewhere, "
+        f"so {biome} ends irregularly rather than along a straight row. 0.00 to 1.00 "
+        f"puts no limit on it.",
+        0.0, 1.0, step=0.01, decimals=2, parts=("top", "bottom"), ordered=True,
+        beside=f"{biome}_fraction", short="band",
+    )
 
 
 SETTINGS: tuple[Setting, ...] = (
@@ -184,35 +210,80 @@ SETTINGS: tuple[Setting, ...] = (
         0.5, 8.0, step=0.5, decimals=1, suffix=" z per tile", advanced=True,
     ),
     Setting(
-        "forest_fraction", "Forest fraction", BIOMES,
-        "Share of the dry land covered by forest, taken from the wettest ground left "
-        "after snow, desert and jungle are placed.",
-        0.0, 1.0, step=0.01, decimals=2,
+        "temperature_profile", "Temperature profile", BIOMES,
+        "Where the cold and the warm ground lie. 'Coldest at the top' runs from cold "
+        "along the top edge to warm along the bottom edge. 'Coldest at the top and "
+        "bottom' puts the warmth across the middle of the map with cold along both "
+        "edges, for snow at both poles. The zones below it set how far the full cold "
+        "and the full heat reach; the temperature bar in the overview pane shows them "
+        "and its handles move them. Temperature decides where snow, desert and jungle "
+        "go; each biome's band then fences it in. The fractions below are independent "
+        "shares of the dry land and need not add up to 1.",
+        0, 0, choices=(("north", "Coldest at the top"), ("poles", "Coldest at the top and bottom")),
     ),
     Setting(
-        "jungle_fraction", "Jungle fraction", BIOMES,
-        "Share of the dry land covered by jungle, placed on the warmest, wettest ground "
-        "in the southern part of the map.",
-        0.0, 1.0, step=0.01, decimals=2,
+        "north_zones", "Temperature zones", BIOMES,
+        "Full cold from the top edge down to 'cold to', full heat from 'hot from' down "
+        "to the bottom edge, and a steady change between the two, as fractions of the "
+        "map height (0.00 is the top edge, 1.00 the bottom edge). 0.00 and 1.00 give "
+        "one even gradient from top to bottom.",
+        0.0, 1.0, step=0.01, decimals=2, parts=("cold to", "hot from"), ordered=True,
+        profile="north",
     ),
     Setting(
-        "desert_fraction", "Desert fraction", BIOMES,
-        "Share of the dry land covered by desert, placed on the warmest, driest ground.",
-        0.0, 1.0, step=0.01, decimals=2,
+        "poles_cold", "Cold zones", BIOMES,
+        "Full cold from the top edge down to 'to', and from 'from' down to the bottom "
+        "edge, as fractions of the map height (0.00 is the top edge, 1.00 the bottom "
+        "edge). The heat zone lies between them, with a steady change on either side.",
+        0.0, 1.0, step=0.01, decimals=2, parts=("to", "from"), ordered=True,
+        profile="poles",
+    ),
+    Setting(
+        "poles_heat", "Heat zone", BIOMES,
+        "Full heat between 'from' and 'to', as fractions of the map height (0.00 is "
+        "the top edge, 1.00 the bottom edge), inside the cold zones. 0.50 and 0.50 "
+        "give one even change from cold at each edge to a single warmest row.",
+        0.0, 1.0, step=0.01, decimals=2, parts=("from", "to"), ordered=True,
+        profile="poles",
     ),
     Setting(
         "snow_fraction", "Snow fraction", BIOMES,
-        "Share of the dry land covered by snow, placed in the cold north (the top third "
-        "of the map).",
+        "Share of the dry land covered by snow, placed on the coldest ground inside "
+        "the snow band. When the band cuts the cold ground short, the actual share "
+        "comes out lower.",
         0.0, 1.0, step=0.01, decimals=2,
     ),
+    _band_setting("snow"),
+    Setting(
+        "desert_fraction", "Desert fraction", BIOMES,
+        "Share of the dry land covered by desert, placed on the warmest, driest ground "
+        "inside the desert band.",
+        0.0, 1.0, step=0.01, decimals=2,
+    ),
+    _band_setting("desert"),
+    Setting(
+        "jungle_fraction", "Jungle fraction", BIOMES,
+        "Share of the dry land covered by jungle, placed on the warmest, wettest ground "
+        "inside the jungle band. When the band cuts that ground short, the actual "
+        "share comes out lower.",
+        0.0, 1.0, step=0.01, decimals=2,
+    ),
+    _band_setting("jungle"),
+    Setting(
+        "forest_fraction", "Forest fraction", BIOMES,
+        "Share of the dry land covered by forest, taken from the wettest ground left "
+        "after snow, desert and jungle are placed, inside the forest band.",
+        0.0, 1.0, step=0.01, decimals=2,
+    ),
+    _band_setting("forest"),
     Setting(
         "swamp_fraction", "Swamp fraction", BIOMES,
         "Target share of the dry land covered by swamp, as a few large flat inland "
-        "patches. Swamp only forms on flat, non-hilly ground away from the coast, so "
-        "the result can be lower.",
+        "patches. Swamp only forms on flat, non-hilly ground away from the coast, "
+        "inside the swamp band, so the result can be lower.",
         0.0, 1.0, step=0.01, decimals=2,
     ),
+    _band_setting("swamp"),
     Setting(
         "towns", "Town count", TOWNS,
         "Towns to attempt, each on a flat grassy plain near the coast and joined to its "
@@ -311,11 +382,18 @@ def validate_config_dict(value: dict[str, Any]) -> None:
     for setting in SETTINGS:
         current = value[setting.name]
         within = f"{setting.label} must be between {setting.range_text()}."
-        if setting.parts:
+        if setting.choices:
+            if current not in dict(setting.choices):
+                raise ValueError(f"{setting.label} must be {setting.range_text()}.")
+        elif setting.parts:
             if len(current) != len(setting.parts):
                 raise ValueError(f"{setting.label} needs {len(setting.parts)} values.")
             if any(not setting.minimum <= float(v) <= setting.maximum for v in current):
                 raise ValueError(within)
+            if setting.ordered and float(current[0]) > float(current[1]):
+                raise ValueError(
+                    f"{setting.label}: '{setting.parts[0]}' must not be below '{setting.parts[1]}'."
+                )
         elif setting.is_list:
             levels = tuple(int(v) for v in current)
             if not levels or len(levels) > setting.max_items:
@@ -326,6 +404,11 @@ def validate_config_dict(value: dict[str, Any]) -> None:
                 raise ValueError(within)
         elif not setting.minimum <= float(current) <= setting.maximum:
             raise ValueError(within)
+    # the heat zone of the two-pole profile lies inside its cold zones
+    cold_to, cold_from = (float(v) for v in value["poles_cold"])
+    hot_from, hot_to = (float(v) for v in value["poles_heat"])
+    if hot_from < cold_to or hot_to > cold_from:
+        raise ValueError("Heat zone must lie between the Cold zones.")
 
 
 def make_config(value: dict[str, Any]) -> Config:

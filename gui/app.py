@@ -15,13 +15,28 @@ import json
 import multiprocessing
 import secrets
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QLinearGradient,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -45,6 +60,7 @@ from PySide6.QtWidgets import (
 )
 
 from gen.config import Config
+from gen.macro import BIOME_BANDS, BIOME_MATERIAL, OVERVIEW_PALETTE, OVERVIEW_SCALE, PROFILE_HANDLES
 from gui.config_io import (
     BIOMES,
     COAST,
@@ -52,6 +68,8 @@ from gui.config_io import (
     ELEVATION,
     FIXED_FIELDS,
     GROUPS,
+    MAP_HEIGHT,
+    MAP_WIDTH,
     SETTINGS,
     TOWNS,
     WATER,
@@ -83,8 +101,69 @@ from gui.tasks import (
 )
 
 
+# the settings the overview pane's overlays follow: the bands, the zone settings
+# of every profile, and the profile itself
+BAND_FIELDS = tuple(f"{name}_band" for name in BIOME_BANDS)
+ZONE_FIELDS = tuple(dict.fromkeys(
+    setting for handles in PROFILE_HANDLES.values() for setting, _index in handles
+))
+OVERLAY_FIELDS = BAND_FIELDS + ZONE_FIELDS + ("temperature_profile",)
+
+# the overlay's geometry, in viewport pixels: a temperature bar and one bar per
+# biome stand along the left edge of the map region, their names above them
+BAR_WIDTH = 18       # the temperature bar and each biome bar
+BAR_GAP = 8          # between biome bars
+BAR_MARGIN = 3       # inside the map border
+BAR_GROUP_GAP = 8    # between the temperature bar and the first biome bar
+HANDLE_RADIUS = 6    # the round handle at every boundary
+HANDLE_REACH = 7     # how far from a boundary a press still takes its handle
+BAND_STEP = 0.01     # a dragged boundary snaps to the form's step
+COLD, MILD, WARM = QColor(30, 90, 255), QColor(255, 235, 40), QColor(235, 25, 25)
+
+
+@dataclass(frozen=True)
+class Track:
+    """One bar of the overlay: its rect, its colour and label, and its chain of
+    boundaries from top to bottom as (setting, index) pairs whose values come from
+    the form. A biome bar's chain is its band's two edges; the temperature bar's is
+    the active profile's zone boundaries."""
+
+    key: str
+    rect: QRectF
+    chain: tuple[tuple[str, int], ...]
+    colour: QColor
+    label: str
+
+
+@dataclass
+class Drag:
+    """What the pointer has hold of on a track: one handle, by its index in the
+    chain (several indices when handles coincide, until the first movement picks
+    one), or the stretch between two consecutive handles. `start_y` and `start`
+    remember the press position and the chain's values at that moment."""
+
+    track: Track
+    handles: list[int] | None = None
+    stretch: tuple[int, int] | None = None
+    start_y: float = 0.0
+    start: tuple[float, ...] = ()
+
+
 class PreviewView(QGraphicsView):
-    """The overview image pane: fits the image on load, drags to pan, wheel zooms."""
+    """The overview image pane: fits the image on load, drags to pan, wheel zooms.
+
+    Until an image arrives it shows the map's outline at the overview's scale, and
+    two overlays can be drawn along the left edge of the outline or of the image:
+    the temperature bar (blue cold, yellow mild, red warm, laid out by the profile
+    and its zones) and one narrow bar per biome, in the order the biomes are placed,
+    filled where its band allows it. Every boundary on a bar is a handle: dragging
+    one emits `handle_dragged`, which the window feeds back into the settings form,
+    and the form's changes come back through `set_overlay`. Dragging the stretch
+    between two boundaries moves both, so a thin band can still be moved. Hovering
+    a bar shows its values and rules its boundaries across the whole map.
+    """
+
+    handle_dragged = Signal(str, int, float)   # setting, index within it, new value
 
     def __init__(self):
         super().__init__()
@@ -94,7 +173,17 @@ class PreviewView(QGraphicsView):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setBackgroundBrush(Qt.GlobalColor.black)
+        self.setMouseTracking(True)
         self._has_image = False
+        self.scene().setSceneRect(
+            QRectF(0, 0, MAP_WIDTH / OVERVIEW_SCALE, MAP_HEIGHT / OVERVIEW_SCALE)
+        )
+        self.values: dict[str, tuple[float, ...]] = {}   # every overlay setting, by name
+        self.profile = "north"
+        self.show_bands = True
+        self.show_temperature = True
+        self.hover: str | None = None      # the key of the track under the pointer
+        self.drag: Drag | None = None
 
     def set_image(self, path: Path) -> bool:
         pixmap = QPixmap(str(path))
@@ -106,9 +195,21 @@ class PreviewView(QGraphicsView):
         self.fit_image()
         return True
 
+    def map_rect(self) -> QRectF:
+        """The map's extent in scene coordinates: the image, or the outline."""
+        return self.item.boundingRect() if self._has_image else self.sceneRect()
+
     def fit_image(self) -> None:
-        if self._has_image:
-            self.fitInView(self.item, Qt.AspectRatioMode.KeepAspectRatio)
+        self.fitInView(self.map_rect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not self._has_image:
+            self.fit_image()   # the outline always fills the pane; an image keeps its zoom
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.fit_image()
 
     def wheelEvent(self, event) -> None:
         if not self._has_image:
@@ -116,9 +217,303 @@ class PreviewView(QGraphicsView):
         factor = 1.18 if event.angleDelta().y() > 0 else 1 / 1.18
         self.scale(factor, factor)
 
+    def set_overlay(self, values: dict[str, tuple[float, ...]], profile: str) -> None:
+        """The overlay settings (bands and zones, by setting name) and the profile."""
+        self.values = {name: tuple(float(v) for v in value) for name, value in values.items()}
+        self.profile = profile
+        self.viewport().update()
+
+    def set_overlay_visible(self, bands: bool | None = None, temperature: bool | None = None) -> None:
+        if bands is not None:
+            self.show_bands = bands
+        if temperature is not None:
+            self.show_temperature = temperature
+        self.viewport().update()
+
+    # geometry, all in viewport pixels
+
+    def _area(self) -> QRectF:
+        return QRectF(self.mapFromScene(self.map_rect()).boundingRect())
+
+    def _tracks(self, area: QRectF) -> list[Track]:
+        """The visible bars, left to right: the temperature bar, then the biomes in
+        placement order."""
+        tracks = []
+        x = area.left() + BAR_MARGIN
+        if self.show_temperature:
+            chain = tuple(handle for handle in PROFILE_HANDLES[self.profile] if handle[0] in self.values)
+            tracks.append(Track("temperature", QRectF(x, area.top(), BAR_WIDTH, area.height()), chain, WARM, "Temp"))
+            x += BAR_WIDTH + BAR_GROUP_GAP
+        if self.show_bands:
+            for name in BIOME_BANDS:
+                setting = f"{name}_band"
+                if setting in self.values:
+                    colour = QColor(*OVERVIEW_PALETTE[BIOME_MATERIAL[name]])
+                    rect = QRectF(x, area.top(), BAR_WIDTH, area.height())
+                    tracks.append(Track(name, rect, ((setting, 0), (setting, 1)), colour, name.capitalize()))
+                    x += BAR_WIDTH + BAR_GAP
+        return tracks
+
+    def _value(self, handle) -> float:
+        setting, index = handle
+        return min(1.0, max(0.0, self.values[setting][index]))
+
+    @staticmethod
+    def _edge_y(area: QRectF, value: float) -> float:
+        return area.top() + value * area.height()
+
+    def _track_at(self, pos) -> Track | None:
+        for track in self._tracks(self._area()):
+            if track.rect.adjusted(-2, 0, 2, 0).contains(pos):
+                return track
+        return None
+
+    def _grab_at(self, pos) -> Drag | None:
+        """What a press at `pos` would take hold of: the nearest handle within reach
+        (all of them when several coincide there), else the stretch the pointer is
+        on, else None."""
+        track = self._track_at(pos)
+        if track is None or not track.chain:
+            return None
+        area = self._area()
+        start = tuple(self._value(handle) for handle in track.chain)
+        ys = [self._edge_y(area, value) for value in start]
+        near = [i for i, y in enumerate(ys) if abs(pos.y() - y) <= HANDLE_REACH]
+        if near:
+            best = min(abs(pos.y() - ys[i]) for i in near)
+            handles = [i for i in near if abs(pos.y() - ys[i]) - best < 0.5]
+            return Drag(track, handles=handles, start_y=pos.y(), start=start)
+        for i in range(len(ys) - 1):
+            if ys[i] < pos.y() < ys[i + 1]:
+                return Drag(track, stretch=(i, i + 1), start_y=pos.y(), start=start)
+        return None
+
+    # the mouse: handles and stretches first, then the pane's own pan
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            grab = self._grab_at(event.position())
+            if grab is not None:
+                self.drag = grab
+                self.viewport().update()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.drag is not None:
+            self._drag_to(event.position())
+            event.accept()
+            return
+        track = self._track_at(event.position())
+        hover = track.key if track else None
+        if hover != self.hover:
+            self.hover = hover
+            self.viewport().update()
+        if event.buttons() == Qt.MouseButton.NoButton:   # never during a pan
+            grab = self._grab_at(event.position())
+            cursor = Qt.CursorShape.OpenHandCursor
+            if grab is not None:
+                cursor = Qt.CursorShape.SizeVerCursor if grab.handles else Qt.CursorShape.SizeAllCursor
+            self.viewport().setCursor(cursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self.drag is not None:
+            self.drag = None
+            self.viewport().update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self.hover is not None:
+            self.hover = None
+            self.viewport().update()
+        super().leaveEvent(event)
+
+    def _drag_to(self, pos) -> None:
+        """Move what is being dragged to the pointer, snapped to the form's step: a
+        handle stays between its neighbours (coincident handles part in the direction
+        of the first movement), a stretch keeps its length and stays between the
+        boundaries around it or the map edges."""
+        drag = self.drag
+        chain = drag.track.chain
+        start = drag.start
+        area = self._area()
+        height = area.height() or 1.0
+        lat = min(1.0, max(0.0, (pos.y() - area.top()) / height))
+        if drag.handles is not None:
+            if len(drag.handles) > 1:
+                dy = pos.y() - drag.start_y
+                if abs(dy) < 1:
+                    return
+                drag.handles = [min(drag.handles) if dy < 0 else max(drag.handles)]
+            i = drag.handles[0]
+            low = self._value(chain[i - 1]) if i > 0 else 0.0
+            high = self._value(chain[i + 1]) if i + 1 < len(chain) else 1.0
+            value = min(max(self._snap(lat), low), high)
+            self.handle_dragged.emit(chain[i][0], chain[i][1], value)
+            return
+        a, b = drag.stretch
+        delta = lat - min(1.0, max(0.0, (drag.start_y - area.top()) / height))
+        low = self._value(chain[a - 1]) if a > 0 else 0.0
+        high = self._value(chain[b + 1]) if b + 1 < len(chain) else 1.0
+        delta = min(max(delta, low - start[a]), high - start[b])
+        new_a, new_b = self._snap(start[a] + delta), self._snap(start[b] + delta)
+        order = ((b, new_b), (a, new_a)) if delta > 0 else ((a, new_a), (b, new_b))
+        for i, value in order:                  # the leading edge first, so they never cross
+            self.handle_dragged.emit(chain[i][0], chain[i][1], value)
+
+    @staticmethod
+    def _snap(value: float) -> float:
+        return round(min(1.0, max(0.0, round(value / BAND_STEP) * BAND_STEP)), 2)
+
+    # painting
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        super().drawForeground(painter, rect)
+        if not (self.show_bands or self.show_temperature):
+            return
+        # drawn in viewport pixels, so bars and captions keep their size at any zoom
+        area = self._area()
+        tracks = self._tracks(area)
+        painter.save()
+        painter.setWorldMatrixEnabled(False)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        font = painter.font()
+        font.setPointSizeF(max(7.0, font.pointSizeF() - 1))
+        painter.setFont(font)
+        active = self.drag.track.key if self.drag is not None else self.hover
+        self._draw_rules(painter, area, tracks, active)
+        for track in tracks:
+            if track.key == "temperature":
+                self._draw_temperature(painter, track)
+            else:
+                self._draw_band(painter, area, track, track.key == active)
+        painter.setPen(QPen(QColor(255, 255, 255), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(area)
+        # the handles sit over the border, so one at 0 or 1 stays visible
+        for track in tracks:
+            self._draw_grips(painter, area, track, track.key == active)
+        self._draw_captions(painter, area, tracks, active)
+        self._draw_labels(painter, area, tracks, active)
+        painter.restore()
+
+    def _draw_temperature(self, painter: QPainter, track: Track) -> None:
+        """The temperature bar: the profile's gradient between its zone boundaries."""
+        bar = track.rect
+        bounds = sorted(self._value(handle) for handle in track.chain)
+        gradient = QLinearGradient(bar.topLeft(), bar.bottomLeft())
+        if self.profile == "poles" and len(bounds) == 4:
+            cold_to, hot_from, hot_to, cold_from = bounds
+            stops = ((0.0, COLD), (cold_to, COLD), ((cold_to + hot_from) / 2, MILD), (hot_from, WARM),
+                     (hot_to, WARM), ((hot_to + cold_from) / 2, MILD), (cold_from, COLD), (1.0, COLD))
+        else:
+            cold_to, hot_from = (bounds + [0.0, 1.0])[:2]
+            stops = ((0.0, COLD), (cold_to, COLD), ((cold_to + hot_from) / 2, MILD), (hot_from, WARM), (1.0, WARM))
+        for at, colour in stops:
+            gradient.setColorAt(at, colour)
+        painter.setPen(QPen(QColor(0, 0, 0), 1))
+        painter.setBrush(QBrush(gradient))
+        painter.drawRect(bar)
+
+    def _draw_band(self, painter: QPainter, area: QRectF, track: Track, active: bool) -> None:
+        """A biome bar: the whole bar faintly, the band solid."""
+        bar = track.rect
+        top, bottom = sorted(self._value(handle) for handle in track.chain)
+        track_fill = QColor(track.colour)
+        track_fill.setAlpha(70)
+        painter.setPen(QPen(QColor(0, 0, 0, 170), 1))
+        painter.setBrush(track_fill)
+        painter.drawRect(bar)
+        band = QRectF(bar.left(), self._edge_y(area, top), bar.width(), (bottom - top) * area.height())
+        fill = QColor(track.colour)
+        fill.setAlpha(255 if active else 215)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(fill)
+        painter.drawRect(band)
+
+    def _draw_grips(self, painter: QPainter, area: QRectF, track: Track, active: bool) -> None:
+        """A round handle at every boundary of the track's chain."""
+        painter.setPen(QPen(QColor(0, 0, 0), 1.5))
+        painter.setBrush(QColor(255, 255, 255) if active else QColor(225, 225, 225))
+        radius = HANDLE_RADIUS + (1 if active else 0)
+        for handle in track.chain:
+            centre = QPointF(track.rect.center().x(), self._edge_y(area, self._value(handle)))
+            painter.drawEllipse(centre, radius, radius)
+
+    def _draw_rules(self, painter: QPainter, area: QRectF, tracks: list[Track], active: str | None) -> None:
+        """The active track's boundaries ruled across the whole map, a biome's band
+        also tinted."""
+        track = next((t for t in tracks if t.key == active), None)
+        if track is None or not track.chain:
+            return
+        ys = [self._edge_y(area, self._value(handle)) for handle in track.chain]
+        if track.key != "temperature":
+            tint = QColor(track.colour)
+            tint.setAlpha(45)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(tint)
+            painter.drawRect(QRectF(area.left(), min(ys), area.width(), max(ys) - min(ys)))
+        painter.setPen(QPen(QColor(255, 255, 255), 1.5, Qt.PenStyle.DashLine))
+        for y in ys:
+            painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
+
+    def _draw_captions(self, painter: QPainter, area: QRectF, tracks: list[Track], active: str | None) -> None:
+        """The active track's values, right of every bar so they cover no bar, kept
+        inside the map region."""
+        track = next((t for t in tracks if t.key == active), None)
+        if track is None or not track.chain:
+            return
+        x = max(t.rect.right() for t in tracks) + 8
+        half = (painter.fontMetrics().height() + 4) / 2
+        for handle in track.chain:
+            value = self._value(handle)
+            y = min(max(self._edge_y(area, value), area.top() + half), area.bottom() - half)
+            self._caption(painter, x, y, f"{value:.2f}")
+
+    def _draw_labels(self, painter: QPainter, area: QRectF, tracks: list[Track], active: str | None) -> None:
+        """Each bar's name centred above it, in two staggered rows so neighbours never
+        collide, kept inside the map region; the active bar's name bold on a lit pill,
+        drawn last so it stands over its neighbours."""
+        plain = painter.font()
+        bold = QFont(plain)
+        bold.setBold(True)
+        metrics = painter.fontMetrics()
+        height = metrics.height() + 4
+        order = sorted(enumerate(tracks), key=lambda item: item[1].key == active)
+        for index, track in order:
+            lit = track.key == active
+            painter.setFont(bold if lit else plain)
+            width = painter.fontMetrics().horizontalAdvance(track.label) + 8
+            x = track.rect.center().x() - width / 2
+            x = min(max(x, area.left() + 2), area.right() - width - 2)
+            y = area.top() + 3 + (index % 2) * (height + 2)
+            box = QRectF(x, y, width, height)
+            painter.setPen(QPen(QColor(255, 255, 255), 1) if lit else Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(track.colour).lighter(115) if lit else QColor(0, 0, 0, 170))
+            painter.drawRoundedRect(box, 3, 3)
+            painter.setPen(QColor(0, 0, 0) if lit else QColor(255, 255, 255))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, track.label)
+        painter.setFont(plain)
+
+    @staticmethod
+    def _caption(painter: QPainter, x: float, y: float, text: str) -> None:
+        """White text on a dark pill, centred vertically on `y`, starting at `x`."""
+        metrics = painter.fontMetrics()
+        box = QRectF(x, y - (metrics.height() + 4) / 2, metrics.horizontalAdvance(text) + 8, metrics.height() + 4)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 170))
+        painter.drawRoundedRect(box, 3, 3)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+
 
 # the setting groups, in reading order down the left column and then the right
-COLUMNS = ((WORLD, CONTINENT, COAST, TOWNS), (WATER, ELEVATION, BIOMES))
+COLUMNS = ((WORLD, CONTINENT, COAST, WATER), (ELEVATION, BIOMES, TOWNS))
 
 
 class WheelGuard(QObject):
@@ -141,10 +536,13 @@ class SettingsForm(QWidget):
     label of a fine-tuning setting all come from that one record.
     """
 
+    biome_changed = Signal()   # a band, a zone or the temperature profile was edited
+
     def __init__(self):
         super().__init__()
         # a scalar setting maps to its box; a pair setting to a tuple of boxes
         self.widgets: dict[str, QWidget | tuple[QWidget, ...]] = {}
+        self._rows: dict[str, tuple[QFormLayout, QWidget]] = {}   # a setting's form and row field
         self._wheel_guard = WheelGuard(self)
         defaults = config_dict(Config())
         content = QWidget()
@@ -162,10 +560,28 @@ class SettingsForm(QWidget):
                 form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
                 form.setVerticalSpacing(4)
                 form.setContentsMargins(8, 6, 8, 6)
-                for setting in settings_in(group):
-                    form.addRow(
-                        self._label(setting), self._field(setting, defaults[setting.name])
-                    )
+                settings = settings_in(group)
+                fields = {s.name: self._field(s, defaults[s.name]) for s in settings}
+                for setting in settings:
+                    if setting.beside:
+                        continue
+                    field = fields[setting.name]
+                    joined = [s for s in settings if s.beside == setting.name]
+                    if joined:
+                        # one row for a setting and the settings drawn beside it
+                        row = QWidget()
+                        layout = QHBoxLayout(row)
+                        layout.setContentsMargins(0, 0, 0, 0)
+                        layout.addWidget(field, 1)
+                        for extra in joined:
+                            tag = QLabel(extra.short)
+                            tag.setToolTip(tooltip_html(extra))
+                            layout.addSpacing(6)
+                            layout.addWidget(tag)
+                            layout.addWidget(fields[extra.name], 2)
+                        field = row
+                    form.addRow(self._label(setting), field)
+                    self._rows[setting.name] = (form, field)
                 column.addWidget(box)
             column.addStretch(1)
             columns.addLayout(column, 1)
@@ -179,6 +595,21 @@ class SettingsForm(QWidget):
         note = QLabel(fixed_note())
         note.setWordWrap(True)
         layout.addWidget(note)
+        profile = self.widgets["temperature_profile"]
+        assert isinstance(profile, QComboBox)
+        profile.currentIndexChanged.connect(self._sync_profile_rows)
+        self._sync_profile_rows()
+
+    def _sync_profile_rows(self) -> None:
+        """Show only the zone rows of the selected temperature profile."""
+        profile = self.widgets["temperature_profile"]
+        assert isinstance(profile, QComboBox)
+        current = profile.currentData()
+        for setting in SETTINGS:
+            if setting.profile and setting.name in self._rows:
+                form, field = self._rows[setting.name]
+                row, _role = form.getWidgetPosition(field)
+                form.setRowVisible(row, setting.profile == current)
 
     @staticmethod
     def _label(setting: Setting) -> QLabel:
@@ -206,6 +637,18 @@ class SettingsForm(QWidget):
         return spin
 
     def _field(self, setting: Setting, default: Any) -> QWidget:
+        if setting.choices:
+            combo = QComboBox()
+            for value, label in setting.choices:
+                combo.addItem(label, value)
+            combo.setCurrentIndex(combo.findData(default))
+            combo.setToolTip(tooltip_html(setting))
+            combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            combo.installEventFilter(self._wheel_guard)
+            if setting.name in OVERLAY_FIELDS:
+                combo.currentIndexChanged.connect(self.biome_changed)
+            self.widgets[setting.name] = combo
+            return combo
         if setting.parts:
             row = QWidget()
             layout = QHBoxLayout(row)
@@ -214,6 +657,8 @@ class SettingsForm(QWidget):
             for part, value in zip(setting.parts, default):
                 layout.addWidget(QLabel(part))
                 spin = self._spin(setting, value)
+                if setting.name in OVERLAY_FIELDS:
+                    spin.valueChanged.connect(self.biome_changed)
                 layout.addWidget(spin, 1)
                 boxes.append(spin)
             self.widgets[setting.name] = tuple(boxes)
@@ -247,7 +692,10 @@ class SettingsForm(QWidget):
         result: dict[str, Any] = {name: defaults[name] for name in FIXED_FIELDS}
         for setting in SETTINGS:
             widget = self.widgets[setting.name]
-            if setting.parts:
+            if setting.choices:
+                assert isinstance(widget, QComboBox)
+                result[setting.name] = widget.currentData()
+            elif setting.parts:
                 result[setting.name] = tuple(spin.value() for spin in widget)
             elif setting.is_list:
                 assert isinstance(widget, QLineEdit)
@@ -269,7 +717,10 @@ class SettingsForm(QWidget):
         for setting in SETTINGS:
             widget = self.widgets[setting.name]
             value = values[setting.name]
-            if setting.parts:
+            if setting.choices:
+                assert isinstance(widget, QComboBox)
+                widget.setCurrentIndex(widget.findData(value))
+            elif setting.parts:
                 for spin, part in zip(widget, value):
                     spin.setValue(part)
             elif setting.is_list:
@@ -286,6 +737,22 @@ class SettingsForm(QWidget):
         assert isinstance(widget, QSpinBox)
         widget.setValue(seed)
 
+    def set_part(self, name: str, index: int, value: float) -> None:
+        """A handle was dragged in the overview pane: put its value in the box."""
+        spins = self.widgets[name]
+        spins[index].setValue(value)
+
+    def overlay_state(self) -> tuple[dict[str, tuple[float, ...]], str]:
+        """The bands, the zones and the temperature profile as the boxes show them
+        right now, unvalidated, for the overview pane's overlays."""
+        values = {
+            name: tuple(spin.value() for spin in self.widgets[name])
+            for name in BAND_FIELDS + ZONE_FIELDS
+        }
+        combo = self.widgets["temperature_profile"]
+        assert isinstance(combo, QComboBox)
+        return values, combo.currentData()
+
 
 class MainWindow(QMainWindow):
     """The main window. `process`/`queue` are the running child process and its event
@@ -294,7 +761,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Ultima Online Procedural Map Generator")
-        self.resize(1280, 860)
+        self.resize(1280, 960)
         self.settings = load_settings()
         self.uo_directory = str(self.settings.get("uo_directory", ""))
         self.output_root = Path(
@@ -337,6 +804,26 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         self.fit_button = QPushButton("Fit Preview")
+        self.bands_toggle = QCheckBox("Show biome bands")
+        self.bands_toggle.setChecked(True)
+        self.bands_toggle.setToolTip(
+            "Stand one bar per biome along the left edge of the map in the overview pane, "
+            "in the order the biomes are placed, filled where its band allows it. Drag the "
+            "handle at either end of a band to move that edge, or drag the band itself to "
+            "move the whole of it; hover a bar to read its values and see the band ruled "
+            "across the map. Generating a preview or a world switches this off so the new "
+            "map shows unobstructed; tick it again to draw the bars over the map."
+        )
+        self.temperature_toggle = QCheckBox("Show temperature profile")
+        self.temperature_toggle.setChecked(True)
+        self.temperature_toggle.setToolTip(
+            "Stand the temperature bar along the left edge of the map in the overview pane: "
+            "blue is cold, yellow mild and red warm, laid out as the selected temperature "
+            "profile and its zones have it. Drag a handle to move where the full cold or the "
+            "full heat ends, or drag the stretch between two handles to move both. "
+            "Generating a preview or a world switches it off; tick it again to draw it over "
+            "the map."
+        )
         self.open_button = QPushButton("Open Output Folder")
         self.uo_button = QPushButton("Select UO Folder")
         self.output_button = QPushButton("Choose Output Folder")
@@ -345,6 +832,15 @@ class MainWindow(QMainWindow):
         self.world_button.clicked.connect(self.generate_world)
         self.cancel_button.clicked.connect(self.cancel_job)
         self.fit_button.clicked.connect(self.preview.fit_image)
+        self.bands_toggle.toggled.connect(
+            lambda on: self.preview.set_overlay_visible(bands=on)
+        )
+        self.temperature_toggle.toggled.connect(
+            lambda on: self.preview.set_overlay_visible(temperature=on)
+        )
+        self.form.biome_changed.connect(self.refresh_overlay)
+        self.preview.handle_dragged.connect(self.form.set_part)
+        self.refresh_overlay()
         self.open_button.clicked.connect(self.open_output)
         self.uo_button.clicked.connect(self.choose_uo)
         self.output_button.clicked.connect(self.choose_output)
@@ -398,7 +894,12 @@ class MainWindow(QMainWindow):
         preview_box = QGroupBox("World overview")
         preview_layout = QVBoxLayout(preview_box)
         preview_layout.addWidget(self.preview, 1)
-        preview_layout.addWidget(self.fit_button, 0, Qt.AlignmentFlag.AlignRight)
+        preview_tools = QHBoxLayout()
+        preview_tools.addWidget(self.bands_toggle)
+        preview_tools.addWidget(self.temperature_toggle)
+        preview_tools.addStretch(1)
+        preview_tools.addWidget(self.fit_button)
+        preview_layout.addLayout(preview_tools)
 
         upper = QSplitter()
         upper.addWidget(left)
@@ -468,9 +969,21 @@ class MainWindow(QMainWindow):
         self.poll_timer.start()
         self.elapsed_timer.start()
 
+    def refresh_overlay(self) -> None:
+        """A band, a zone or the profile changed: redraw the overlays from the form."""
+        values, profile = self.form.overlay_state()
+        self.preview.set_overlay(values, profile)
+
+    def hide_overlays(self) -> None:
+        """Generating: the new map must show unobstructed. The check boxes under the
+        pane bring the overlays back, over the map."""
+        self.bands_toggle.setChecked(False)
+        self.temperature_toggle.setChecked(False)
+
     def generate_preview(self) -> None:
         """Generate Preview: reuse the cached image for these exact settings, else
         render one in a child process."""
+        self.hide_overlays()
         config = self.config_or_error()
         if config is None:
             return
@@ -485,6 +998,7 @@ class MainWindow(QMainWindow):
     def generate_world(self) -> None:
         """Generate World: needs a valid UO folder; writes into a .partial folder that
         the child renames on success."""
+        self.hide_overlays()
         config = self.config_or_error()
         if config is None:
             return

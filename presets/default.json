@@ -8,18 +8,18 @@
   ],
   "radii": [
     0.3,
-    0.38
+    0.32
   ],
-  "margin": 220,
-  "coast_wavelength": 900.0,
-  "coast_amp": 1.0,
+  "margin": 150,
+  "coast_wavelength": 800.0,
+  "coast_amp": 0.95,
   "coast_detail": 0.22,
   "coast_smooth": 2,
-  "islands": 7,
+  "islands": 4,
   "min_island": 400,
-  "min_lake_size": 60,
+  "min_lake_size": 300,
   "rivers": 12,
-  "lakes": 10,
+  "lakes": 6,
   "hill_levels": [
     5,
     10,
@@ -31,11 +31,44 @@
   "ramp_slope": 2.0,
   "hill_fraction": 0.45,
   "mountain_fraction": 0.09,
-  "forest_fraction": 0.38,
-  "jungle_fraction": 0.08,
+  "temperature_profile": "poles",
+  "north_zones": [
+    0.0,
+    1.0
+  ],
+  "poles_cold": [
+    0.1,
+    0.9
+  ],
+  "poles_heat": [
+    0.5,
+    0.5
+  ],
+  "snow_fraction": 0.08,
+  "snow_band": [
+    0.0,
+    1.0
+  ],
   "desert_fraction": 0.07,
-  "snow_fraction": 0.05,
+  "desert_band": [
+    0.0,
+    1.0
+  ],
+  "jungle_fraction": 0.08,
+  "jungle_band": [
+    0.0,
+    1.0
+  ],
+  "forest_fraction": 0.38,
+  "forest_band": [
+    0.0,
+    1.0
+  ],
   "swamp_fraction": 0.02,
+  "swamp_band": [
+    0.0,
+    1.0
+  ],
   "towns": 9,
   "town_min_spacing": 550,
   "road_width": 3

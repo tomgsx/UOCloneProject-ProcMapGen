@@ -28,7 +28,7 @@ you `metrics.json`.
 python3 -m unittest discover -s tests
 ```
 
-40 tests, under a second, no client files needed (one test reads the client's
+54 tests, a few seconds, no client files needed (one test reads the client's
 `tiledata.mul` and skips itself when `UO_CLIENT_DIR` is unset). The Qt form
 tests set `QT_QPA_PLATFORM=offscreen` themselves. The same suite runs on Linux
 and Windows in CI (`.github/workflows/ci.yml`).

@@ -84,13 +84,32 @@ All world settings sit on one page, grouped by what they shape:
 | **Coastline** | How rounded or ragged the coast is, and how large its bays and headlands are. |
 | **Islands and inland water** | Extra islands, the smallest island and lake kept, and how many rivers and extra lakes to attempt. |
 | **Elevation** | How much of the land is hilly, how much of that is impassable mountain, the terrace heights and the ramp slope. |
-| **Biomes** | The share of dry land given to forest, jungle, desert, snow and swamp; grass is what remains. |
+| **Biomes** | The temperature profile, then for each biome in the order it is placed (snow, desert, jungle, forest, swamp) its share of the dry land and the band of the map it may occupy; grass is what remains. |
 | **Towns and roads** | How many towns to place, how far apart, and how wide the roads are. |
 
 Hover over any setting - its name or its box - for a plain-language
 description of what it does, the range it accepts and its default. Settings
 drawn in *italics* are fine-tuning; the defaults suit most worlds. A value
 outside its range is refused with a message naming the setting.
+
+The biome fractions are independent shares of the dry land, claimed in the
+order snow, desert, jungle, forest, with swamp laid over flat inland ground
+last; they need not add up to 1. Each biome's **band** is the part of the map,
+top to bottom, outside which it never forms (0.00 is the top edge, 1.00 the
+bottom). Inside the band the biome's front stands in from each edge by a
+depth that varies along it, touching the edge at its furthest points and
+withdrawing into bays elsewhere, so a biome ends irregularly rather than
+along a straight row; a narrow band keeps an open middle.
+
+The **temperature profile** decides where the cold ground lies: coldest at
+the top, or coldest at the top and bottom with the warmth across the middle,
+for snow at both poles. Its **zones** set how far the full cold and the full
+heat reach: with the cold at the top, everything above "cold to" is fully
+cold and everything below "hot from" fully hot; with cold at both ends, the
+cold zones reach in from each edge and the heat zone lies between them. The
+default world uses the two-pole profile with full cold in the outer tenth of
+the map at each end and a single warmest row across the middle, so snow
+forms at both poles.
 
 Two things are fixed and are therefore not settings: the map size, which is
 the Felucca layout of 7168 x 4096 tiles, and the water levels (the surface at
@@ -129,6 +148,22 @@ normal-looking output folder is always a complete world.
 **Fit Preview** refits the overview to the pane; drag to pan and scroll to
 zoom. **Open Output Folder** opens the latest world's folder (or the output
 root) in your file manager.
+
+Before anything is generated the pane shows the map's outline with two
+overlays along its left edge that follow the Biomes settings as you edit
+them, each bar named above it. **Show temperature profile** stands a narrow
+bar there, blue for cold through yellow to red for warm, laid out as the
+selected profile and its zones have it, with a handle at every zone boundary.
+**Show biome bands** stands one narrow bar per biome beside it, in the order
+the biomes are placed, filled where its band allows it, with a handle at
+either end of the band. Drag a handle to move that boundary, or drag the
+stretch between two handles to move both together; a handle never passes its
+neighbour, and a stretch stops at the map edge. Hover a bar to read its
+values and see its boundaries ruled across the whole map. Generating a
+preview or a world switches both overlays off so the new map shows
+unobstructed; tick either box to draw it over the map.
+
+![The biome bands and the temperature profile over the map outline](docs/images/overlays.png)
 
 ### What a world folder contains
 

@@ -196,26 +196,133 @@ def rock_profile(cfg: Config, z, rock):
         z = np.where(rock, zr, z)
     return z
 
+# Temperature profiles (Config.temperature_profile): where the cold ground lies.
+# Each profile's zones are its own settings, and PROFILE_HANDLES lists them in
+# top-to-bottom order as (setting, index) pairs: the boundaries a user can move.
+TEMPERATURE_PROFILES = ("north", "poles")
+PROFILE_HANDLES = {
+    "north": (("north_zones", 0), ("north_zones", 1)),
+    "poles": (("poles_cold", 0), ("poles_heat", 0), ("poles_heat", 1), ("poles_cold", 1)),
+}
+
+def _ramp(lat, cold_at, hot_at, cold_above):
+    """1 at `cold_at`, 0 at `hot_at`, linear between and clipped outside, in either
+    direction; a step at `hot_at` when the two coincide, cold on the side
+    `cold_above` names."""
+    span = hot_at - cold_at
+    if span == 0:
+        return ((lat < hot_at) if cold_above else (lat > hot_at)).astype(np.float32)
+    return np.clip((hot_at - lat) / span, 0, 1).astype(np.float32)
+
+def coldness(cfg: Config, lat):
+    """How cold each row is before noise, 0 warm to 1 cold, from the temperature
+    profile and its zones. "north": full cold from the top edge down to the first of
+    `north_zones`, full heat from the second down to the bottom edge, a steady change
+    between (the defaults 0 and 1 make it one gradient). "poles": full cold above the
+    first of `poles_cold` and below the second, full heat between the two of
+    `poles_heat`, steady changes between. `lat` is the latitude per tile, 0 at the
+    top edge and 1 at the bottom."""
+    if cfg.temperature_profile == "poles":
+        cold_to, cold_from = cfg.poles_cold
+        hot_from, hot_to = cfg.poles_heat
+        upper = _ramp(lat, cold_to, hot_from, cold_above=True)
+        lower = _ramp(lat, cold_from, hot_to, cold_above=False)
+        return np.maximum(upper, lower)
+    cold_to, hot_from = cfg.north_zones
+    return _ramp(lat, cold_to, hot_from, cold_above=True)
+
+# Each biome is fenced into its band (Config.<name>_band): the part of the map, top
+# and bottom as fractions of the map height, outside which it never forms. Inside
+# the band its front does not follow the fence's row: it stands in from the fence
+# by a depth that varies along it, touching the fence at its furthest points and
+# withdrawing into bays elsewhere. Broad noise shapes the bays a thousand tiles
+# across, bay-sized noise adds inlets and tongues, and fine noise frays the front.
+# The depth fades out toward the map edges, so an edge at 0 or 1 is exactly the map
+# edge and costs nothing.
+BAND_WANDER = 0.38    # the broad shape of the front, as a fraction of the map height
+BAND_BAYS = 0.11      # bays and tongues a few hundred tiles across, same unit
+BAND_RAGGED = 0.045   # the fine fraying, same unit
+BAND_INSET = 0.35     # how much of that shape becomes depth in from the fence
+BAND_DEPTH_SHARE = 0.45   # the most of its band's height a front may stand in
+BAND_FRAY_SEED = 17   # seed offset of the fraying noise, shared by every edge
+# The seed offsets of the (broad, bays) noise for each biome's (top, bottom) edge,
+# distinct so that no two fronts coincide, in the order the biomes are placed.
+BAND_SEEDS = {
+    "snow": ((200, 201), (15, 16)),
+    "desert": ((202, 203), (204, 205)),
+    "jungle": ((206, 207), (208, 209)),
+    "forest": ((210, 211), (212, 213)),
+    "swamp": ((214, 215), (216, 217)),
+}
+BIOME_BANDS = tuple(BAND_SEEDS)
+# The material code each biome paints (gen.materials).
+BIOME_MATERIAL = {"snow": 5, "desert": 4, "jungle": 3, "forest": 2, "swamp": 6}
+
+def band_edge(cfg: Config, value, seeds, fray, inward, limit=1.0):
+    """The front along one fence of a band, as a latitude per tile (float32 [W, H]):
+    the fence at `value`, moved into the band (`inward` is +1 for a top fence, -1 for
+    a bottom one) by a depth that is never negative and is zero at the front's
+    furthest point, so the front touches the fence but never crosses it. The depth
+    is scaled down, keeping its shape, so that it never exceeds `limit` (a share of
+    the band's height, so a narrow band keeps an open middle). `seeds` are the seed
+    offsets of the broad and the bay noise; `fray` is the fine noise every edge
+    shares."""
+    W, H = cfg.width, cfg.height
+    broad = upsample(fbm((W // 4, H // 4), cfg.seed + seeds[0], 4, 1600.0 / 4), 4)[:W, :H]
+    bays = upsample(fbm((W // 4, H // 4), cfg.seed + seeds[1], 3, 300.0 / 4), 4)[:W, :H]
+    swing = 4.0 * value * (1.0 - value)   # 1 at the middle of the map, 0 at either edge
+    shape = BAND_WANDER * broad + BAND_BAYS * bays + BAND_RAGGED * fray
+    depth = swing * BAND_INSET * (shape.max() - shape)
+    deepest = float(depth.max())
+    if deepest > limit:
+        depth = depth * (limit / deepest)
+    return (value + inward * depth).astype(np.float32)
+
+def band_mask(cfg: Config, name, lat, cache=None):
+    """Where the biome `name` is allowed by its band: bool [W, H], never outside the
+    band and standing in from each fence by the front's depth. `lat` is the latitude
+    per tile (0 at the top edge, 1 at the bottom). `cache` is a dict the caller keeps
+    across biomes so the fraying noise is built once."""
+    top, bottom = getattr(cfg, f"{name}_band")
+    mask = np.ones(lat.shape, bool)
+    if top <= 0.0 and bottom >= 1.0:
+        return mask
+    if cache is None:
+        cache = {}
+    fray = cache.get("fray")
+    if fray is None:
+        fray = cache["fray"] = fbm((cfg.width, cfg.height), cfg.seed + BAND_FRAY_SEED, 3, 50.0)
+    top_seeds, bottom_seeds = BAND_SEEDS[name]
+    limit = BAND_DEPTH_SHARE * max(bottom - top, 0.0)
+    if top > 0.0:
+        mask &= lat >= band_edge(cfg, top, top_seeds, fray, inward=1.0, limit=limit)
+    if bottom < 1.0:
+        mask &= lat < band_edge(cfg, bottom, bottom_seeds, fray, inward=-1.0, limit=limit)
+    return mask
+
 def biomes(cfg: Config, land, hilly, rock, z):
     """The material map (uint8 [W, H], gen.materials codes): 0 water, 1 grass, 2 forest,
-    3 jungle, 4 sand, 5 snow, 6 swamp, 7 rock. Biomes are chosen by temperature (a
-    north-south gradient plus noise) and moisture (noise), each as the top fraction of
+    3 jungle, 4 sand, 5 snow, 6 swamp, 7 rock. Biomes are chosen by temperature (the
+    profile's coldness plus noise) and moisture (noise), each as the top fraction of
     dry land by its own score, in the order snow, desert, jungle, forest, swamp; grass
-    is what remains."""
+    is what remains. Each biome is also fenced into its band (`band_mask`) and stands
+    in from the fence, so its share can come out below its fraction."""
     W, H = cfg.width, cfg.height
     lat = np.broadcast_to((np.arange(H, dtype=np.float32) / H)[None, :], (W, H))   # 0 north .. 1 south
-    temp = (1 - lat) * -1.0 + fbm((W // 4, H // 4), cfg.seed + 9, 4, 900.0 / 4).repeat(4, 0).repeat(4, 1)[:W, :H] * 0.5
-    # temp is low in the north; moisture comes from noise
+    temp = -coldness(cfg, lat) + fbm((W // 4, H // 4), cfg.seed + 9, 4, 900.0 / 4).repeat(4, 0).repeat(4, 1)[:W, :H] * 0.5
+    # temp is low where the profile is cold; moisture comes from noise
     moist = fbm((W // 4, H // 4), cfg.seed + 10, 5, 600.0 / 4, gain=0.55)
     moist = upsample(moist, 4)[:W, :H]
     fine = fbm((W, H), cfg.seed + 11, 3, 40.0) * 0.12
     moist = moist + fine
     m = np.ones((W, H), np.uint8)  # grass
     dry = land
-    # snow: the coldest ground, restricted to the northern third
+    bands = {}
+    allowed = lambda name: band_mask(cfg, name, lat, bands)
+    # snow: the coldest ground
     snow_score = -temp + 0.3 * moist
     thr = _top_threshold(snow_score[dry], cfg.snow_fraction)
-    snow = dry & (snow_score > thr) & (lat < 0.35)
+    snow = dry & (snow_score > thr) & allowed("snow")
     snow = ndimage.binary_closing(snow, np.ones((9, 9))) & dry
     snow = ndimage.binary_fill_holes(snow) & dry
     lab_s, ns = ndimage.label(snow); sz = np.bincount(lab_s.ravel()); keep = sz >= 4000; keep[0] = False
@@ -223,20 +330,20 @@ def biomes(cfg: Config, land, hilly, rock, z):
     # desert: warm and dry
     des_score = temp - moist + fine
     thr = _top_threshold(des_score[dry], cfg.desert_fraction)
-    desert = dry & (des_score > thr) & ~snow
-    # jungle: warm and wet, southern half only
+    desert = dry & (des_score > thr) & ~snow & allowed("desert")
+    # jungle: warm and wet
     jun_score = temp + moist
     thr = _top_threshold(jun_score[dry], cfg.jungle_fraction)
-    jungle = dry & (jun_score > thr) & ~snow & ~desert & (lat > 0.55)
+    jungle = dry & (jun_score > thr) & ~snow & ~desert & allowed("jungle")
     # forest: moist, a share of whatever the three biomes above left
     f_score = moist + 0.15 * fbm((W, H), cfg.seed + 12, 2, 90.0)
     thr = _top_threshold(f_score[dry & ~snow & ~desert & ~jungle], cfg.forest_fraction)
-    forest = dry & (f_score > thr) & ~snow & ~desert & ~jungle
+    forest = dry & (f_score > thr) & ~snow & ~desert & ~jungle & allowed("forest")
     # swamp: a few big flat inland patches (Britannia has 3 patches of 15-35k tiles), from low-frequency blobs
     dwat = ndimage.distance_transform_edt(land)
     swamp_field = fbm((W // 4, H // 4), cfg.seed + 13, 3, 900.0 / 4)
     swamp_field = upsample(swamp_field, 4)[:W, :H] + 0.25 * fbm((W, H), cfg.seed + 14, 3, 60.0)
-    cand = dry & (z <= 0.5) & ~hilly & ~snow & ~desert & (dwat > 25) & (lat > 0.3)
+    cand = dry & (z <= 0.5) & ~hilly & ~snow & ~desert & (dwat > 25) & allowed("swamp")
     # the fraction is of all dry land, taken from the qualifying share only
     thr = _top_threshold(swamp_field[cand], cfg.swamp_fraction / max(cand.sum() / dry.sum(), 1e-3))
     swamp = cand & (swamp_field > thr)
@@ -267,12 +374,16 @@ def clean_material(m, min_width=3, protect=(0, 7), min_area=60):
             out[removed] = out[idx[0], idx[1]][removed]
     return out
 
-def overview_png(m, z, path, scale=8):
+# The overview's colour per material code, and its tiles per pixel.
+OVERVIEW_PALETTE = {0: (20, 60, 120), 1: (80, 140, 60), 2: (40, 90, 40), 3: (30, 110, 70), 4: (210, 190, 120),
+                    5: (235, 235, 240), 6: (70, 90, 50), 7: (120, 115, 110), 8: (140, 100, 60), 9: (170, 130, 90), 10: (40, 70, 130)}
+OVERVIEW_SCALE = 8
+
+def overview_png(m, z, path, scale=OVERVIEW_SCALE):
     """The overview image: one pixel per `scale` tiles, the material palette shaded by
     slope. This is the generator's own drawing, not client art."""
     from PIL import Image
-    pal = {0: (20, 60, 120), 1: (80, 140, 60), 2: (40, 90, 40), 3: (30, 110, 70), 4: (210, 190, 120),
-           5: (235, 235, 240), 6: (70, 90, 50), 7: (120, 115, 110), 8: (140, 100, 60), 9: (170, 130, 90), 10: (40, 70, 130)}
+    pal = OVERVIEW_PALETTE
     sm = m[::scale, ::scale]; sz = z[::scale, ::scale]
     img = np.zeros(sm.shape + (3,), np.uint8)
     for k, c in pal.items(): img[sm == k] = c

@@ -31,11 +31,44 @@
   "ramp_slope": 2.0,
   "hill_fraction": 0.45,
   "mountain_fraction": 0.09,
-  "forest_fraction": 0.34,
-  "jungle_fraction": 0.08,
-  "desert_fraction": 0.07,
+  "temperature_profile": "north",
+  "north_zones": [
+    0.0,
+    1.0
+  ],
+  "poles_cold": [
+    0.0,
+    1.0
+  ],
+  "poles_heat": [
+    0.5,
+    0.5
+  ],
   "snow_fraction": 0.05,
+  "snow_band": [
+    0.0,
+    0.4
+  ],
+  "desert_fraction": 0.07,
+  "desert_band": [
+    0.0,
+    1.0
+  ],
+  "jungle_fraction": 0.08,
+  "jungle_band": [
+    0.5,
+    1.0
+  ],
+  "forest_fraction": 0.34,
+  "forest_band": [
+    0.0,
+    1.0
+  ],
   "swamp_fraction": 0.02,
+  "swamp_band": [
+    0.25,
+    1.0
+  ],
   "towns": 5,
   "town_min_spacing": 550,
   "road_width": 3

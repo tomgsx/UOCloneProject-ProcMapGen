@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "UOCloneProject-ProcMapGen"
-version = "1.0.0"
+version = "1.1.0"
 description = "Procedural Ultima Online map generator with a desktop GUI (Linux and Windows)"
 readme = "README.md"
 license = "GPL-3.0-only"

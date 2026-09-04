@@ -60,7 +60,9 @@ full-resolution NumPy arrays indexed `[x, y]` (shape 7168×4096):
 1. **macro** (`macro.py`) — continent mask from warped fBm over an ellipse
    plus islands; lakes from landmass holes; hill/mountain classes; a terraced
    DEM with ramp-slope cones; biome fields (forest/jungle/desert/snow/swamp)
-   by moisture + latitude noise.
+   by moisture + temperature (a profile along the map's height, plus noise),
+   each fenced into its latitude band, its front standing in from the fence
+   by a varying depth.
 2. **hydro** (`hydro.py`) — rivers routed with Dijkstra over a cost raster
    (plains cheap, hills dear, rock blocked) from hill-foot springs to the
    sea, widening downstream; extra lakes.

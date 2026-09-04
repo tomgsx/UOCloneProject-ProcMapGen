@@ -83,6 +83,9 @@ class ConfigTests(unittest.TestCase):
     def test_defaults_sit_inside_every_range(self):
         for setting in SETTINGS:
             default = config_dict(Config())[setting.name]
+            if setting.choices:
+                self.assertIn(default, dict(setting.choices), setting.name)
+                continue
             values = default if isinstance(default, tuple) else (default,)
             for value in values:
                 self.assertGreaterEqual(value, setting.minimum, setting.name)
@@ -99,7 +102,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("1 to 100 each, lowest first, up to 12 levels", tip)
         tip = tooltip_html(SETTING_BY_NAME["margin"])
         self.assertIn("0 tiles to 1000 tiles", tip)
-        self.assertIn("Default:</b> 220 tiles", tip)
+        self.assertIn("Default:</b> 150 tiles", tip)
         for setting in SETTINGS:
             self.assertTrue(setting.tooltip.endswith("."), setting.name)
 
@@ -107,6 +110,8 @@ class ConfigTests(unittest.TestCase):
         for name, bad in (
             ("road_width", 0), ("coast_amp", 2.5), ("mountain_fraction", -0.1),
             ("centre", (0.4, 0.99)), ("radii", (0.6, 0.3)), ("hill_levels", (5, 200)),
+            ("snow_band", (0.6, 0.4)), ("jungle_band", (0.2, 1.5)),
+            ("temperature_profile", "sideways"), ("north_zones", (0.8, 0.2)),
         ):
             value = config_dict(Config())
             value[name] = bad
@@ -115,6 +120,10 @@ class ConfigTests(unittest.TestCase):
         value = config_dict(Config())
         value["hill_levels"] = (10, 5)
         with self.assertRaisesRegex(ValueError, "ascending"):
+            make_config(value)
+        value = config_dict(Config())
+        value["poles_cold"], value["poles_heat"] = (0.3, 0.7), (0.2, 0.8)
+        with self.assertRaisesRegex(ValueError, "Heat zone must lie between"):
             make_config(value)
 
 
@@ -171,7 +180,11 @@ class FormTests(unittest.TestCase):
         from gui.app import SettingsForm
 
         form = SettingsForm()
-        expected = Config(seed=4242, centre=(0.35, 0.55), road_width=5, hill_levels=(4, 8))
+        expected = Config(
+            seed=4242, centre=(0.35, 0.55), road_width=5, hill_levels=(4, 8),
+            temperature_profile="poles", snow_band=(0.1, 0.5),
+            north_zones=(0.1, 0.9), poles_cold=(0.1, 0.9), poles_heat=(0.4, 0.6),
+        )
         form.set_value(expected)
         self.assertEqual(form.value(), expected)
         self.assertEqual(set(form.widgets), set(SETTING_BY_NAME))
@@ -181,6 +194,146 @@ class FormTests(unittest.TestCase):
         self.assertEqual(italic, {s.label for s in SETTINGS if s.advanced})
         form.set_seed(12)
         self.assertEqual(form.value().seed, 12)
+
+    def test_profile_choices_are_the_generator_profiles(self):
+        from gen.macro import TEMPERATURE_PROFILES
+
+        choices = dict(SETTING_BY_NAME["temperature_profile"].choices)
+        self.assertEqual(set(choices), set(TEMPERATURE_PROFILES))
+
+    def test_overlays_follow_the_form_and_hide_when_generating(self):
+        import gui.app as app_module
+        from gui.app import MainWindow
+
+        with tempfile.TemporaryDirectory() as directory:
+            # keep the window's files out of the repository and every dialog closed
+            original = (app_module.load_settings, app_module.save_settings, app_module.QMessageBox.warning)
+            app_module.load_settings = lambda: {"output_root": directory}
+            app_module.save_settings = lambda value: None
+            app_module.QMessageBox.warning = lambda *args, **kwargs: None
+            try:
+                window = MainWindow()
+                started = []
+                window.start_process = lambda kind, target, args: started.append(kind)
+                window.choose_uo = lambda: None
+                self.assertTrue(window.bands_toggle.isChecked())
+                self.assertTrue(window.temperature_toggle.isChecked())
+                self.assertEqual(window.preview.values["snow_band"], (0.0, 1.0))
+                spins = window.form.widgets["snow_band"]
+                spins[1].setValue(0.5)
+                self.assertEqual(window.preview.values["snow_band"], (0.0, 0.5))
+                # the zone rows follow the profile: only the selected profile's show
+                form_rows = window.form._rows
+                def visible(name):
+                    form, field = form_rows[name]
+                    return form.isRowVisible(form.getWidgetPosition(field)[0])
+                self.assertEqual(window.preview.profile, "poles")
+                self.assertFalse(visible("north_zones"))
+                self.assertTrue(visible("poles_cold") and visible("poles_heat"))
+                combo = window.form.widgets["temperature_profile"]
+                combo.setCurrentIndex(combo.findData("north"))
+                self.assertEqual(window.preview.profile, "north")
+                self.assertTrue(visible("north_zones"))
+                self.assertFalse(visible("poles_cold"))
+                combo.setCurrentIndex(combo.findData("poles"))
+                # a dragged handle lands in the box, and the box feeds the overlay
+                window.preview.handle_dragged.emit("snow_band", 1, 0.62)
+                self.assertEqual(spins[1].value(), 0.62)
+                self.assertEqual(window.preview.values["snow_band"], (0.0, 0.62))
+                window.preview.handle_dragged.emit("poles_heat", 0, 0.4)
+                self.assertEqual(window.form.widgets["poles_heat"][0].value(), 0.4)
+                self.assertEqual(window.preview.values["poles_heat"], (0.4, 0.5))
+
+                window.preview_button.click()
+                self.assertEqual(started, ["preview"])
+                self.assertFalse(window.bands_toggle.isChecked())
+                self.assertFalse(window.preview.show_bands)
+                self.assertFalse(window.preview.show_temperature)
+                window.bands_toggle.setChecked(True)
+                self.assertTrue(window.preview.show_bands)
+                window.world_button.click()      # refused for want of a UO folder, hides anyway
+                self.assertFalse(window.preview.show_bands)
+            finally:
+                app_module.load_settings, app_module.save_settings, app_module.QMessageBox.warning = original
+
+    def test_overlay_draws_over_the_outline_before_any_image(self):
+        from gui.app import PreviewView
+
+        view = PreviewView()
+        view.resize(400, 300)
+        view.set_overlay({"snow_band": (0.0, 0.35), "swamp_band": (0.3, 1.0), "north_zones": (0.0, 1.0)}, "north")
+        view.show()
+        self.application.processEvents()
+        image = view.grab().toImage()
+        self.assertFalse(image.isNull())
+        # the temperature bar is drawn first, then the bars in placement order
+        tracks = view._tracks(view._area())
+        self.assertEqual([t.key for t in tracks], ["temperature", "snow", "swamp"])
+        probe = tracks[0].rect.center()
+        colour = image.pixelColor(int(probe.x()), int(probe.y()))
+        self.assertNotEqual((colour.red(), colour.green(), colour.blue()), (0, 0, 0))
+        view.set_overlay_visible(bands=False, temperature=False)
+        colour = view.grab().toImage().pixelColor(int(probe.x()), int(probe.y()))
+        self.assertEqual((colour.red(), colour.green(), colour.blue()), (0, 0, 0))
+
+    def test_hovering_and_dragging_a_bar(self):
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+        from gui.app import PreviewView
+
+        view = PreviewView()
+        view.resize(600, 400)
+        values = {"snow_band": (0.0, 0.35), "swamp_band": (0.3, 1.0), "north_zones": (0.0, 1.0),
+                  "poles_cold": (0.0, 1.0), "poles_heat": (0.5, 0.5)}
+        view.set_overlay(values, "north")
+        view.show()
+        self.application.processEvents()
+        emitted = []
+        view.handle_dragged.connect(lambda name, index, value: emitted.append((name, index, value)))
+        area = view._area()
+        tracks = {t.key: t for t in view._tracks(area)}
+        snow, temperature = tracks["snow"].rect, tracks["temperature"].rect
+
+        def send(kind, pos, button=Qt.MouseButton.NoButton, buttons=Qt.MouseButton.NoButton):
+            event = QMouseEvent(kind, pos, view.viewport().mapToGlobal(pos.toPoint()).toPointF(),
+                                button, buttons, Qt.KeyboardModifier.NoModifier)
+            self.application.sendEvent(view.viewport(), event)
+
+        def drag(x, from_value, to_value):
+            start = QPointF(x, area.top() + from_value * area.height())
+            end = QPointF(x, area.top() + to_value * area.height())
+            send(QEvent.Type.MouseButtonPress, start, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+            send(QEvent.Type.MouseMove, end, buttons=Qt.MouseButton.LeftButton)
+            send(QEvent.Type.MouseButtonRelease, end, Qt.MouseButton.LeftButton)
+
+        # hovering the bar names it; the pane's middle is nobody's bar
+        send(QEvent.Type.MouseMove, QPointF(snow.center().x(), area.center().y()))
+        self.assertEqual(view.hover, "snow")
+        send(QEvent.Type.MouseMove, area.center())
+        self.assertIsNone(view.hover)
+        # the bottom handle of snow sits at 0.35 of the height; drag it to 0.60
+        drag(snow.center().x(), 0.35, 0.6)
+        self.assertIsNone(view.drag)
+        self.assertEqual(emitted[-1], ("snow_band", 1, 0.6))
+        # the top handle can never pass the bottom one
+        view.set_overlay({**values, "snow_band": (0.0, 0.6)}, "north")
+        drag(snow.center().x(), 0.0, 0.9)
+        self.assertEqual(emitted[-1], ("snow_band", 0, 0.6))
+        # dragging the band itself moves both edges, keeping its length, up to the map edge
+        view.set_overlay({**values, "snow_band": (0.1, 0.4)}, "north")
+        emitted.clear()
+        drag(snow.center().x(), 0.25, 0.95)
+        self.assertEqual(emitted, [("snow_band", 1, 1.0), ("snow_band", 0, 0.7)])
+        # the temperature bar: the top-cold profile's hot handle at 1.00 dragged up to 0.70
+        drag(temperature.center().x(), 1.0, 0.7)
+        self.assertEqual(emitted[-1], ("north_zones", 1, 0.7))
+        # the two-pole profile's coincident heat handles part in the direction of the drag
+        view.set_overlay(values, "poles")
+        emitted.clear()
+        drag(temperature.center().x(), 0.5, 0.3)
+        self.assertEqual(emitted[-1], ("poles_heat", 0, 0.3))
+        drag(temperature.center().x(), 0.5, 0.7)
+        self.assertEqual(emitted[-1], ("poles_heat", 1, 0.7))
 
     def test_wheel_over_an_unfocused_box_changes_nothing(self):
         # scrolling the page must not turn whichever spin box the pointer crosses
